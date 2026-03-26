@@ -81,6 +81,13 @@ static inline rwlock_t *ksu_get_policy_rwlock(void) { extern rwlock_t policy_rwl
 #else
 static inline rwlock_t *ksu_get_policy_rwlock(void) { return NULL; }
 #endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0) || defined(KSU_COMPAT_HAS_BACKPORTED_CPUS_PTR)
+static inline const cpumask_t *ksu_get_current_cpumask_t() { return current->cpus_ptr; }
+#else
+static inline cpumask_t *ksu_get_current_cpumask_t() { return &current->cpus_allowed; }
+#endif
+
 #endif // #ifndef SELINUX_POLICY_INSTEAD_SELINUX_SS
 
 static int apply_kernelsu_rules_fn(void *ptr)
@@ -181,49 +188,62 @@ static int apply_kernelsu_rules_fn(void *ptr)
 
 void apply_kernelsu_rules()
 {
-	struct policydb *db;
+    struct policydb *db;
 
-	if (!getenforce()) {
-		pr_info("SELinux permissive or disabled, apply rules!\n");
-	}
+    if (!getenforce()) {
+        pr_info("SELinux permissive or disabled, apply rules!\n");
+    }
 
 #ifdef SELINUX_POLICY_INSTEAD_SELINUX_SS
-	struct selinux_policy *pol, *old_pol = selinux_state.policy;
-	mutex_lock(&selinux_state.policy_mutex);
-	pol = ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
-	if (!pol) {
-		pr_err("failed to dup selinux_policy\n");
-		goto out_unlock;
-	}
-	db = &pol->policydb;
+    struct selinux_policy *pol, *old_pol = selinux_state.policy;
+    mutex_lock(&selinux_state.policy_mutex);
+    pol = ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
+    if (!pol) {
+        pr_err("failed to dup selinux_policy\n");
+        goto out_unlock;
+    }
+    db = &pol->policydb;
 
-	apply_kernelsu_rules_fn((void *)db);
+    apply_kernelsu_rules_fn((void *)db);
 
-	rcu_assign_pointer(selinux_state.policy, pol);
-	synchronize_rcu();
-	ksu_destroy_sepolicy(old_pol);
+    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
 
-	reset_avc_cache();
+    reset_avc_cache();
 out_unlock:
-	mutex_unlock(&selinux_state.policy_mutex);
+    mutex_unlock(&selinux_state.policy_mutex);
 #else
-	db = get_policydb();
-	rwlock_t *lock = ksu_get_policy_rwlock();
-	
-	if (!lock)
-		goto do_stop_machine;
+    cpumask_t old_mask;
+    db = get_policydb();
+    rwlock_t *lock = ksu_get_policy_rwlock();
+    
+    if (!lock)
+        goto do_stop_machine;
 
-	write_lock(lock);
-	apply_kernelsu_rules_fn((void *)db);
-	write_unlock(lock);
-	goto out_flush;
+    /*
+     * HACK: write_lock() is held with preempt enabled. DO NOT let the
+     * task be migrated to any other CPU than the current CPU. And since
+     * set_cpus_allowed_ptr() can sleep, use raw_smp_processor_id() to get
+     * current CPU and bypass preemption checks.
+     */
+    cpumask_copy(&old_mask, ksu_get_current_cpumask_t());
+    set_cpus_allowed_ptr(current, cpumask_of(raw_smp_processor_id()));
+
+    write_lock(lock);
+    apply_kernelsu_rules_fn((void *)db);
+    write_unlock(lock);
+
+    set_cpus_allowed_ptr(current, &old_mask);
+
+    goto out_flush;
 
 do_stop_machine:
-	stop_machine(apply_kernelsu_rules_fn, (void *)db, NULL);
+    stop_machine(apply_kernelsu_rules_fn, (void *)db, NULL);
 
 out_flush:
-	smp_mb();
-	reset_avc_cache();
+    smp_mb();
+    reset_avc_cache();
 #ifdef CONFIG_KSU_SUSFS
     // Allow umount in zygote process without installing zygisk
     //ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
@@ -677,51 +697,63 @@ out:
 
 int handle_sepolicy(void __user *user_data, u64 data_len)
 {
-	int ret = 0;
-	int success_cmd_count = 0;
+    int ret = 0;
+    int success_cmd_count = 0;
+    cpumask_t old_mask;
 
-	if (!user_data || !data_len) return -EINVAL;
-	if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE) return -E2BIG;
+    if (!user_data || !data_len) return -EINVAL;
+    if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE) return -E2BIG;
 
-	u8 *payload = kvmalloc((size_t)data_len, GFP_KERNEL);
-	if (!payload) return -ENOMEM;
+    u8 *payload = kvmalloc((size_t)data_len, GFP_KERNEL);
+    if (!payload) return -ENOMEM;
 
-	if (copy_from_user(payload, user_data, (size_t)data_len)) {
-		ret = -EFAULT;
-		goto out_free;
-	}
+    if (copy_from_user(payload, user_data, (size_t)data_len)) {
+        ret = -EFAULT;
+        goto out_free;
+    }
 
-	if (!getenforce()) {
-		pr_info("SELinux permissive or disabled when handle policy!\n");
-	}
+    if (!getenforce()) {
+        pr_info("SELinux permissive or disabled when handle policy!\n");
+    }
 
-	struct handle_sepolicy_args ctx = { 0 };
-	ctx.ctx_success_cmd_count = (void *)&success_cmd_count;
-	ctx.ctx_payload = (void *)payload;
-	ctx.ctx_data_len = (u64)data_len;
+    struct handle_sepolicy_args ctx = { 0 };
+    ctx.ctx_success_cmd_count = (void *)&success_cmd_count;
+    ctx.ctx_payload = (void *)payload;
+    ctx.ctx_data_len = (u64)data_len;
 
-	rwlock_t *lock = ksu_get_policy_rwlock();
-	if (!lock)
-		goto do_stop_machine;
+    rwlock_t *lock = ksu_get_policy_rwlock();
+    if (!lock)
+        goto do_stop_machine;
 
-	// Since we have GFP_ATOMIC, we can atomically lock
-	write_lock(lock);
-	ret = handle_sepolicy_fn((void *)&ctx);
-	write_unlock(lock);
-	goto out_done;
+    /*
+     * HACK: write_lock() is held with preempt enabled. DO NOT let the
+     * task be migrated to any other CPU than the current CPU. And since
+     * set_cpus_allowed_ptr() can sleep, use raw_smp_processor_id() to get
+     * current CPU and bypass preemption checks.
+     */
+    cpumask_copy(&old_mask, ksu_get_current_cpumask_t());
+    set_cpus_allowed_ptr(current, cpumask_of(raw_smp_processor_id()));
+
+    write_lock(lock);
+    ret = handle_sepolicy_fn((void *)&ctx);
+    write_unlock(lock);
+
+    set_cpus_allowed_ptr(current, &old_mask);
+
+    goto out_done;
 
 do_stop_machine:
-	ret = stop_machine(handle_sepolicy_fn, (void *)&ctx, NULL);
+    ret = stop_machine(handle_sepolicy_fn, (void *)&ctx, NULL);
 
 out_done:
-	if (ret) goto out_free;
+    if (ret) goto out_free;
 
-	smp_mb();
-	reset_avc_cache();
-	ret = success_cmd_count;
+    smp_mb();
+    reset_avc_cache();
+    ret = success_cmd_count;
 
 out_free:
-	kvfree(payload);
-	return ret;
+    kvfree(payload);
+    return ret;
 }
 #endif // SELINUX_POLICY_INSTEAD_SELINUX_SS
