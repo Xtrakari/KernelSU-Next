@@ -60,7 +60,7 @@ ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include
 
 obj-$(CONFIG_KSU) += kernelsu.o
 
-KSU_VERSION_TAG := v3.1.0-legacy-susfs
+KSU_VERSION_TAG := v3.2.0-legacy-susfs-v2
 KSU_VERSION := 33169
 
 $(info -- KernelSU-Next version: $(KSU_VERSION))
